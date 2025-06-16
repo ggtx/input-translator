@@ -1,130 +1,184 @@
 import UIKit
-import MLKitTranslate
+import MLKit
 
-class TranslateKeyboard: UIInputViewController {
-    /// When true, translated English will be sent instead of the Chinese text.
-    private var translateMode = true
-    /// Buffer that accumulates pinyin from the user.
-    private var pinyinBuffer = ""
-    /// Simple in-memory cache of previous translations.
-    private var translationCache: [String: String] = [:]
-
-    private let pinyinField = UITextField()
-    private let candidateLabel = UILabel()
-    private let modeControl = UISegmentedControl(items: ["EN", "ZH"])
-    private let sendButton = UIButton(type: .system)
-
+class TranslateKeyboardViewController: UIInputViewController {
+    
+    // MARK: - Properties
+    private var keyboardView: TranslateKeyboardView!
+    private let pinyinEngine = PinyinEngine()
+    private let translationManager = TranslationManager()
+    private let candidateManager = CandidateManager()
+    
+    private var currentPinyin: String = ""
+    private var isTranslateMode: Bool = true
+    private var candidates: [String] = []
+    
+    // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
-
-        pinyinField.placeholder = "Type Pinyin"
-        pinyinField.borderStyle = .roundedRect
-        pinyinField.autocorrectionType = .no
-        pinyinField.addTarget(self, action: #selector(textChanged), for: .editingChanged)
-
-        candidateLabel.font = .systemFont(ofSize: 18)
-        candidateLabel.textAlignment = .center
-
-        modeControl.selectedSegmentIndex = 0
-        modeControl.addTarget(self, action: #selector(modeChanged), for: .valueChanged)
-
-        sendButton.setTitle("Send", for: .normal)
-        sendButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
-
-        let stack = UIStackView(arrangedSubviews: [pinyinField, candidateLabel, modeControl, sendButton])
-        stack.axis = .vertical
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
-
+        setupKeyboard()
+        setupTranslationManager()
+    }
+    
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        updateKeyboardHeight()
+    }
+    
+    // MARK: - Setup
+    private func setupKeyboard() {
+        keyboardView = TranslateKeyboardView(frame: CGRect.zero)
+        keyboardView.delegate = self
+        view.addSubview(keyboardView)
+        
+        keyboardView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
-            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8)
+            keyboardView.topAnchor.constraint(equalTo: view.topAnchor),
+            keyboardView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            keyboardView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            keyboardView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
     }
-
-    @objc private func textChanged() {
-        guard let text = pinyinField.text else { return }
-        handlePinyinInput(text)
+    
+    private func setupTranslationManager() {
+        translationManager.delegate = self
+        translationManager.initializeTranslator()
     }
-
-    @objc private func modeChanged() {
-        translateMode = modeControl.selectedSegmentIndex == 0
-    }
-
-    @objc private func sendTapped() {
-        let chinese = candidateLabel.text ?? ""
-        guard !chinese.isEmpty else { return }
-
-        translateText(chinese) { [weak self] english in
-            guard let self = self else { return }
-            let output = self.translateMode ? english : chinese
-            self.insertText(output)
-            self.resetInput()
+    
+    private func updateKeyboardHeight() {
+        let height: CGFloat = isTranslateMode ? 280 : 220
+        
+        if let constraint = view.constraints.first(where: { $0.firstAttribute == .height }) {
+            constraint.constant = height
+        } else {
+            view.heightAnchor.constraint(equalToConstant: height).isActive = true
         }
     }
-
-    // MARK: - Pinyin Processing
-
-    func handlePinyinInput(_ input: String) {
-        pinyinBuffer = input
+    
+    // MARK: - Input Handling
+    private func handleKeyInput(_ key: String) {
+        switch key {
+        case "delete":
+            handleDeleteKey()
+        case "space":
+            handleSpaceKey()
+        case "return":
+            handleReturnKey()
+        case "translate_toggle":
+            toggleTranslateMode()
+        default:
+            if key.rangeOfCharacter(from: CharacterSet.letters) != nil {
+                handleLetterInput(key)
+            }
+        }
+    }
+    
+    private func handleLetterInput(_ letter: String) {
+        currentPinyin.append(letter)
         updateCandidates()
+        keyboardView.updateInputDisplay(currentPinyin)
     }
-
-    func generateCandidates(_ pinyin: String) -> [String] {
-        let table: [String: String] = [
-            "ni": "你",
-            "hao": "好",
-            "shi": "是",
-            "wo": "我",
-            "zai": "在"
-        ]
-        if let candidate = table[pinyin] {
-            return [candidate]
+    
+    private func handleDeleteKey() {
+        if !currentPinyin.isEmpty {
+            currentPinyin.removeLast()
+            updateCandidates()
+            keyboardView.updateInputDisplay(currentPinyin)
+        } else {
+            textDocumentProxy.deleteBackward()
         }
-        return []
     }
-
+    
+    private func handleSpaceKey() {
+        if !candidates.isEmpty {
+            selectCandidate(candidates.first!)
+        } else {
+            textDocumentProxy.insertText(" ")
+        }
+    }
+    
+    private func handleReturnKey() {
+        textDocumentProxy.insertText("\n")
+        clearInput()
+    }
+    
+    private func toggleTranslateMode() {
+        isTranslateMode.toggle()
+        keyboardView.updateTranslateMode(isTranslateMode)
+        updateKeyboardHeight()
+        clearInput()
+    }
+    
+    // MARK: - Candidate Management
     private func updateCandidates() {
-        let candidates = generateCandidates(pinyinBuffer)
-        candidateLabel.text = candidates.first ?? pinyinBuffer
-    }
-
-    // MARK: - Translation
-
-    func translateText(_ chinese: String, completion: @escaping (String) -> Void) {
-        if let cached = translationCache[chinese] {
-            completion(cached)
-            return
+        if currentPinyin.isEmpty {
+            candidates = []
+        } else {
+            candidates = candidateManager.getCandidates(for: currentPinyin)
         }
-
-        let options = TranslatorOptions(sourceLanguage: .chinese, targetLanguage: .english)
-        let translator = Translator.translator(options: options)
-        let conditions = ModelDownloadConditions(allowsCellularAccess: true, allowsBackgroundDownloading: true)
-        translator.downloadModelIfNeeded(with: conditions) { [weak self] error in
-            guard error == nil else {
-                completion(chinese)
-                return
+        keyboardView.updateCandidates(candidates)
+    }
+    
+    private func selectCandidate(_ candidate: String) {
+        if isTranslateMode {
+            translationManager.translateText(candidate) { [weak self] translation in
+                DispatchQueue.main.async {
+                    self?.showTranslationOptions(original: candidate, translation: translation)
+                }
             }
-            translator.translate(chinese) { text, _ in
-                let result = text ?? chinese
-                self?.translationCache[chinese] = result
-                completion(result)
-            }
+        } else {
+            textDocumentProxy.insertText(candidate)
+            clearInput()
         }
     }
-
-    // MARK: - Output
-
-    func insertText(_ text: String) {
-        textDocumentProxy.insertText(text)
+    
+    private func showTranslationOptions(original: String, translation: String) {
+        keyboardView.showTranslationOptions(original: original, translation: translation)
     }
+    
+    private func clearInput() {
+        currentPinyin = ""
+        candidates = []
+        keyboardView.updateInputDisplay("")
+        keyboardView.updateCandidates([])
+    }
+    
+    // MARK: - Memory Management
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        translationManager.clearCache()
+        candidateManager.clearCache()
+    }
+}
 
-    private func resetInput() {
-        pinyinBuffer = ""
-        pinyinField.text = ""
-        candidateLabel.text = ""
+// MARK: - TranslateKeyboardViewDelegate
+extension TranslateKeyboardViewController: TranslateKeyboardViewDelegate {
+    func didTapKey(_ key: String) {
+        handleKeyInput(key)
+    }
+    
+    func didSelectCandidate(_ candidate: String) {
+        selectCandidate(candidate)
+    }
+    
+    func didSelectTranslation(original: String, useTranslation: Bool) {
+        let textToInsert = useTranslation ? 
+            translationManager.getCachedTranslation(for: original) ?? original : original
+        textDocumentProxy.insertText(textToInsert)
+        clearInput()
+    }
+    
+    func didRequestNextKeyboard() {
+        advanceToNextInputMode()
+    }
+}
+
+// MARK: - TranslationManagerDelegate
+extension TranslateKeyboardViewController: TranslationManagerDelegate {
+    func translationDidComplete(_ translation: String, for originalText: String) {
+    }
+    
+    func translationDidFail(with error: Error, for originalText: String) {
+        print("Translation failed: \(error.localizedDescription)")
     }
 }
